@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from 'react';
+
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -25,6 +26,96 @@ const PONTOS_PARA_VENCER = 12;
 
 function gerarPartidaId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// Converte datas do histórico brasileiro em timestamps confiáveis.
+function obterTimestamp(partida) {
+  if (partida.criadaEm) {
+    const timestampMongo = new Date(partida.criadaEm).getTime();
+    if (!Number.isNaN(timestampMongo)) return timestampMongo;
+  }
+
+  if (partida.data) {
+    const data = String(partida.data);
+    const brasileira = data.match(
+      /^(\d{2})\/(\d{2})\/(\d{4})(?:,\s*(\d{2}):(\d{2}):(\d{2}))?$/
+    );
+
+    if (brasileira) {
+      return new Date(
+        Number(brasileira[3]),
+        Number(brasileira[2]) - 1,
+        Number(brasileira[1]),
+        Number(brasileira[4] || 0),
+        Number(brasileira[5] || 0),
+        Number(brasileira[6] || 0)
+      ).getTime();
+    }
+
+    const timestamp = new Date(data).getTime();
+    if (!Number.isNaN(timestamp)) return timestamp;
+  }
+
+  return 0;
+}
+
+// Garante que os registros antigos recebam um número permanente.
+// A lista do aplicativo é organizada da partida mais recente para a mais antiga.
+function numerarPartidasAntigas(partidas) {
+  const lista = [...partidas];
+  const todasSemNumero = lista.every(
+    (partida) => !Number.isInteger(Number(partida.numeroPartida))
+      || Number(partida.numeroPartida) <= 0
+  );
+
+  if (todasSemNumero) {
+    return lista.map((partida, indice) => ({
+      ...partida,
+      numeroPartida: lista.length - indice,
+    }));
+  }
+
+  const numerosUsados = new Set(
+    lista
+      .map((partida) => Number(partida.numeroPartida))
+      .filter((numero) => Number.isInteger(numero) && numero > 0)
+  );
+
+  let proximoNumero = Math.max(0, ...numerosUsados);
+
+  return lista.map((partida) => {
+    const numeroExistente = Number(partida.numeroPartida);
+
+    if (
+      Number.isInteger(numeroExistente) &&
+      numeroExistente > 0
+    ) {
+      return { ...partida, numeroPartida: numeroExistente };
+    }
+
+    // Para registros antigos misturados com novos, procura um número livre.
+    while (numerosUsados.has(proximoNumero + 1)) {
+      proximoNumero += 1;
+    }
+
+    proximoNumero += 1;
+    numerosUsados.add(proximoNumero);
+
+    return {
+      ...partida,
+      numeroPartida: proximoNumero,
+    };
+  });
+}
+
+function ordenarPartidas(partidas) {
+  return [...partidas].sort((a, b) => {
+    const diferenca = obterTimestamp(b) - obterTimestamp(a);
+
+    if (diferenca !== 0) return diferenca;
+
+    return Number(b.numeroPartida || 0) - Number(a.numeroPartida || 0);
+  });
 }
 
 function estadoInicial(partidas = []) {
@@ -70,20 +161,31 @@ function criarHistorico(estado, placar, partidasAtuais) {
     return partidasAtuais;
   }
 
-  return [
-    {
-      partidaId: id,
-      nomeNos: estado.nomeNos,
-      nomeEles: estado.nomeEles,
-      placarNos: placar[0],
-      placarEles: placar[1],
-      vencedor:
-        equipeVencedora === 0 ? estado.nomeNos : estado.nomeEles,
-      data: new Date().toLocaleString('pt-BR'),
-      sincronizada: false,
-    },
-    ...partidasAtuais,
-  ];
+  const maiorNumero = Math.max(
+    0,
+    ...partidasAtuais.map((partida) => {
+      const numero = Number(partida.numeroPartida);
+      return Number.isInteger(numero) && numero > 0 ? numero : 0;
+    })
+  );
+
+  const agora = new Date();
+
+  const novaPartidaHistorico = {
+    partidaId: id,
+    numeroPartida: maiorNumero + 1,
+    nomeNos: estado.nomeNos,
+    nomeEles: estado.nomeEles,
+    placarNos: placar[0],
+    placarEles: placar[1],
+    vencedor:
+      equipeVencedora === 0 ? estado.nomeNos : estado.nomeEles,
+    data: agora.toLocaleString('pt-BR'),
+    criadaEm: agora.toISOString(),
+    sincronizada: false,
+  };
+
+  return [novaPartidaHistorico, ...partidasAtuais];
 }
 
 function registrarPontos(estado, equipe, pontos, mensagem) {
@@ -117,12 +219,15 @@ function registrarPontos(estado, equipe, pontos, mensagem) {
 
 function normalizarPartidaRemota(partida) {
   return {
+    ...partida,
     partidaId: String(partida.partidaId),
+    numeroPartida: Number(partida.numeroPartida) || 0,
     nomeNos: partida.nomeNos,
     nomeEles: partida.nomeEles,
     placarNos: partida.placarNos,
     placarEles: partida.placarEles,
     vencedor: partida.vencedor,
+    criadaEm: partida.criadaEm || null,
     data: partida.data
       || (partida.criadaEm
         ? new Date(partida.criadaEm).toLocaleString('pt-BR')
@@ -144,12 +249,16 @@ export default function App() {
         if (salvo) {
           const dadosSalvos = JSON.parse(salvo);
 
-          const partidasLocais = (dadosSalvos.partidas || []).map(
-            (partida) => ({
-              ...partida,
-              partidaId: String(partida.partidaId),
-              sincronizada: partida.sincronizada === true,
-            })
+          const partidasLocaisOriginais = (
+            dadosSalvos.partidas || []
+          ).map((partida) => ({
+            ...partida,
+            partidaId: String(partida.partidaId),
+            sincronizada: partida.sincronizada === true,
+          }));
+
+          const partidasLocais = numerarPartidasAntigas(
+            ordenarPartidas(partidasLocaisOriginais)
           );
 
           setDados({
@@ -180,64 +289,81 @@ export default function App() {
     );
   }, [dados, carregado]);
 
-  async function sincronizarPendentes(partidasParaEnviar = dados.partidas) {
-    const pendentes = partidasParaEnviar.filter(
-      (partida) => partida.sincronizada !== true
-    );
+  const sincronizarPendentes = useCallback(
+    async (partidasParaEnviar = dados.partidas) => {
+      const pendentes = partidasParaEnviar.filter(
+        (partida) => partida.sincronizada !== true
+      );
 
-    for (const partida of pendentes) {
-      try {
-        const resposta = await fetch(API_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            partidaId: String(partida.partidaId),
-            nomeNos: partida.nomeNos,
-            nomeEles: partida.nomeEles,
-            placarNos: partida.placarNos,
-            placarEles: partida.placarEles,
-            vencedor: partida.vencedor,
-          }),
-        });
+      for (const partida of pendentes) {
+        try {
+          const resposta = await fetch(API_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              partidaId: String(partida.partidaId),
+              numeroPartida: Number(partida.numeroPartida),
+              nomeNos: partida.nomeNos,
+              nomeEles: partida.nomeEles,
+              placarNos: partida.placarNos,
+              placarEles: partida.placarEles,
+              vencedor: partida.vencedor,
+              data: partida.data,
+              criadaEm: partida.criadaEm,
+            }),
+          });
 
-        if (!resposta.ok) {
           const resultado = await resposta.json().catch(() => ({}));
-          throw new Error(
-            resultado.erro || `Erro HTTP ${resposta.status}`
+
+          if (!resposta.ok) {
+            throw new Error(
+              resultado.erro || `Erro HTTP ${resposta.status}`
+            );
+          }
+
+          const partidaSalva = resultado.partida || {};
+          const numeroConfirmado =
+            Number(partidaSalva.numeroPartida) ||
+            Number(partida.numeroPartida);
+
+          setDados((anterior) => ({
+            ...anterior,
+            partidas: anterior.partidas.map((item) =>
+              String(item.partidaId) === String(partida.partidaId)
+                ? {
+                    ...item,
+                    numeroPartida: numeroConfirmado,
+                    criadaEm: item.criadaEm || partidaSalva.criadaEm,
+                    sincronizada: true,
+                  }
+                : item
+            ),
+          }));
+
+          setErroSincronizacao('');
+        } catch (erro) {
+          console.log(
+            'Não foi possível sincronizar a partida:',
+            erro.message
+          );
+          setErroSincronizacao(
+            'Algumas partidas ainda não foram sincronizadas.'
           );
         }
-
-        setDados((anterior) => ({
-          ...anterior,
-          partidas: anterior.partidas.map((item) =>
-            String(item.partidaId) === String(partida.partidaId)
-              ? { ...item, sincronizada: true }
-              : item
-          ),
-        }));
-
-        setErroSincronizacao('');
-      } catch (erro) {
-        console.log(
-          'Não foi possível sincronizar a partida:',
-          erro.message
-        );
-        setErroSincronizacao(
-          'Algumas partidas ainda não foram sincronizadas.'
-        );
       }
-    }
-  }
+    },
+    [dados.partidas]
+  );
 
   useEffect(() => {
     if (!carregado) return;
 
     sincronizarPendentes(dados.partidas);
-  }, [carregado, dados.partidas]);
+  }, [carregado, dados.partidas, sincronizarPendentes]);
 
-  async function carregarHistoricoRemoto() {
+  const carregarHistoricoRemoto = useCallback(async () => {
     try {
       await sincronizarPendentes(dados.partidas);
 
@@ -248,7 +374,6 @@ export default function App() {
       }
 
       const partidasRemotas = await resposta.json();
-
       const remotasNormalizadas = partidasRemotas.map(
         normalizarPartidaRemota
       );
@@ -256,32 +381,33 @@ export default function App() {
       setDados((anterior) => {
         const partidasPorId = new Map();
 
-        // As partidas do MongoDB já foram confirmadas como salvas.
         remotasNormalizadas.forEach((partida) => {
           partidasPorId.set(String(partida.partidaId), partida);
         });
 
-        // Mantém partidas locais que ainda não chegaram ao MongoDB.
         anterior.partidas.forEach((partida) => {
           const id = String(partida.partidaId);
+          const remota = partidasPorId.get(id);
 
-          if (!partidasPorId.has(id)) {
+          if (!remota) {
             partidasPorId.set(id, partida);
+          } else {
+            // Mantém o número local já atribuído e confirma a sincronização.
+            partidasPorId.set(id, {
+              ...remota,
+              ...partida,
+              numeroPartida:
+                Number(partida.numeroPartida) ||
+                Number(remota.numeroPartida) ||
+                0,
+              sincronizada: true,
+            });
           }
         });
 
-        const partidasCombinadas = Array.from(
-          partidasPorId.values()
-        ).sort((a, b) => {
-          const dataA = new Date(
-            a.data || 0
-          ).getTime();
-          const dataB = new Date(
-            b.data || 0
-          ).getTime();
-
-          return dataB - dataA;
-        });
+        const partidasCombinadas = numerarPartidasAntigas(
+          ordenarPartidas(Array.from(partidasPorId.values()))
+        );
 
         return {
           ...anterior,
@@ -296,7 +422,7 @@ export default function App() {
         'Não foi possível atualizar o histórico do MongoDB.'
       );
     }
-  }
+  }, [dados.partidas, sincronizarPendentes]);
 
   function novaPartida() {
     setDados((anterior) => estadoInicial(anterior.partidas));
@@ -629,7 +755,10 @@ function InicioScreen({ navigation, novaPartida }) {
           style={styles.botaoPrincipal}
           onPress={() => {
             novaPartida();
-            navigation.navigate('Partida');
+            navigation.navigate('Partida', {
+              origem: 'Inicio',
+              novaPartida: true,
+            });
           }}
         >
           <Text style={styles.textoBotaoBranco}>Nova partida</Text>
@@ -652,6 +781,7 @@ function InicioScreen({ navigation, novaPartida }) {
 
 function PartidaScreen({
   navigation,
+  route,
   dados,
   alterarNome,
   alterarEquipeSolicitante,
@@ -665,6 +795,9 @@ function PartidaScreen({
   zerarPlacar,
   novaPartida,
 }) {
+  const origem = route.params?.origem;
+  const iniciouNovaPartida = route.params?.novaPartida;
+
   const proximoValor = VALORES_TRUCO.find(
     (valor) => valor > dados.valorMao
   );
@@ -880,7 +1013,10 @@ function PartidaScreen({
               style={styles.botaoPrincipal}
               onPress={() => {
                 novaPartida();
-                navigation.replace('Partida');
+                navigation.replace('Partida', {
+                  origem: 'Partida',
+                  novaPartida: true,
+                });
               }}
             >
               <Text style={styles.textoBotaoBranco}>Nova partida</Text>
@@ -998,7 +1134,7 @@ function HistoricoScreen({
               style={styles.cartaoHistorico}
             >
               <Text style={styles.numeroHistorico}>
-                Partida {indice + 1}
+                Partida {Number(partida.numeroPartida) || indice + 1}
               </Text>
 
               <Text style={styles.vencedorHistorico}>
