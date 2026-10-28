@@ -1,4 +1,3 @@
-
 import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -20,8 +19,13 @@ import {
 
 const Stack = createNativeStackNavigator();
 const STORAGE_KEY = '@marcador_truco_dados_v2';
+const API_URL = 'http://10.0.2.2:3001/api/partidas';
 const VALORES_TRUCO = [3, 6, 9, 12];
 const PONTOS_PARA_VENCER = 12;
+
+function gerarPartidaId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function estadoInicial(partidas = []) {
   return {
@@ -36,7 +40,7 @@ function estadoInicial(partidas = []) {
     partidas,
     desfazerStack: [],
     mensagem: 'Boa partida!',
-    partidaId: Date.now(),
+    partidaId: gerarPartidaId(),
   };
 }
 
@@ -56,9 +60,11 @@ function criarHistorico(estado, placar, partidasAtuais) {
 
   if (equipeVencedora === -1) return partidasAtuais;
 
+  const id = String(estado.partidaId);
+
   if (
     partidasAtuais.some(
-      (partida) => partida.partidaId === estado.partidaId
+      (partida) => String(partida.partidaId) === id
     )
   ) {
     return partidasAtuais;
@@ -66,7 +72,7 @@ function criarHistorico(estado, placar, partidasAtuais) {
 
   return [
     {
-      partidaId: estado.partidaId,
+      partidaId: id,
       nomeNos: estado.nomeNos,
       nomeEles: estado.nomeEles,
       placarNos: placar[0],
@@ -74,6 +80,7 @@ function criarHistorico(estado, placar, partidasAtuais) {
       vencedor:
         equipeVencedora === 0 ? estado.nomeNos : estado.nomeEles,
       data: new Date().toLocaleString('pt-BR'),
+      sincronizada: false,
     },
     ...partidasAtuais,
   ];
@@ -82,7 +89,6 @@ function criarHistorico(estado, placar, partidasAtuais) {
 function registrarPontos(estado, equipe, pontos, mensagem) {
   const novoPlacar = [...estado.placar];
 
-  // A pontuação nunca ultrapassa 12.
   novoPlacar[equipe] = Math.min(
     PONTOS_PARA_VENCER,
     novoPlacar[equipe] + pontos
@@ -109,9 +115,26 @@ function registrarPontos(estado, equipe, pontos, mensagem) {
   };
 }
 
+function normalizarPartidaRemota(partida) {
+  return {
+    partidaId: String(partida.partidaId),
+    nomeNos: partida.nomeNos,
+    nomeEles: partida.nomeEles,
+    placarNos: partida.placarNos,
+    placarEles: partida.placarEles,
+    vencedor: partida.vencedor,
+    data: partida.data
+      || (partida.criadaEm
+        ? new Date(partida.criadaEm).toLocaleString('pt-BR')
+        : ''),
+    sincronizada: true,
+  };
+}
+
 export default function App() {
   const [dados, setDados] = useState(estadoInicial());
   const [carregado, setCarregado] = useState(false);
+  const [erroSincronizacao, setErroSincronizacao] = useState('');
 
   useEffect(() => {
     async function carregarDados() {
@@ -121,10 +144,21 @@ export default function App() {
         if (salvo) {
           const dadosSalvos = JSON.parse(salvo);
 
+          const partidasLocais = (dadosSalvos.partidas || []).map(
+            (partida) => ({
+              ...partida,
+              partidaId: String(partida.partidaId),
+              sincronizada: partida.sincronizada === true,
+            })
+          );
+
           setDados({
-            ...estadoInicial(dadosSalvos.partidas || []),
+            ...estadoInicial(partidasLocais),
             ...dadosSalvos,
-            partidas: dadosSalvos.partidas || [],
+            partidaId: String(
+              dadosSalvos.partidaId || gerarPartidaId()
+            ),
+            partidas: partidasLocais,
             desfazerStack: [],
           });
         }
@@ -145,6 +179,124 @@ export default function App() {
       (erro) => console.log('Erro ao salvar os dados:', erro)
     );
   }, [dados, carregado]);
+
+  async function sincronizarPendentes(partidasParaEnviar = dados.partidas) {
+    const pendentes = partidasParaEnviar.filter(
+      (partida) => partida.sincronizada !== true
+    );
+
+    for (const partida of pendentes) {
+      try {
+        const resposta = await fetch(API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            partidaId: String(partida.partidaId),
+            nomeNos: partida.nomeNos,
+            nomeEles: partida.nomeEles,
+            placarNos: partida.placarNos,
+            placarEles: partida.placarEles,
+            vencedor: partida.vencedor,
+          }),
+        });
+
+        if (!resposta.ok) {
+          const resultado = await resposta.json().catch(() => ({}));
+          throw new Error(
+            resultado.erro || `Erro HTTP ${resposta.status}`
+          );
+        }
+
+        setDados((anterior) => ({
+          ...anterior,
+          partidas: anterior.partidas.map((item) =>
+            String(item.partidaId) === String(partida.partidaId)
+              ? { ...item, sincronizada: true }
+              : item
+          ),
+        }));
+
+        setErroSincronizacao('');
+      } catch (erro) {
+        console.log(
+          'Não foi possível sincronizar a partida:',
+          erro.message
+        );
+        setErroSincronizacao(
+          'Algumas partidas ainda não foram sincronizadas.'
+        );
+      }
+    }
+  }
+
+  useEffect(() => {
+    if (!carregado) return;
+
+    sincronizarPendentes(dados.partidas);
+  }, [carregado, dados.partidas]);
+
+  async function carregarHistoricoRemoto() {
+    try {
+      await sincronizarPendentes(dados.partidas);
+
+      const resposta = await fetch(API_URL);
+
+      if (!resposta.ok) {
+        throw new Error(`Erro HTTP ${resposta.status}`);
+      }
+
+      const partidasRemotas = await resposta.json();
+
+      const remotasNormalizadas = partidasRemotas.map(
+        normalizarPartidaRemota
+      );
+
+      setDados((anterior) => {
+        const partidasPorId = new Map();
+
+        // As partidas do MongoDB já foram confirmadas como salvas.
+        remotasNormalizadas.forEach((partida) => {
+          partidasPorId.set(String(partida.partidaId), partida);
+        });
+
+        // Mantém partidas locais que ainda não chegaram ao MongoDB.
+        anterior.partidas.forEach((partida) => {
+          const id = String(partida.partidaId);
+
+          if (!partidasPorId.has(id)) {
+            partidasPorId.set(id, partida);
+          }
+        });
+
+        const partidasCombinadas = Array.from(
+          partidasPorId.values()
+        ).sort((a, b) => {
+          const dataA = new Date(
+            a.data || 0
+          ).getTime();
+          const dataB = new Date(
+            b.data || 0
+          ).getTime();
+
+          return dataB - dataA;
+        });
+
+        return {
+          ...anterior,
+          partidas: partidasCombinadas,
+        };
+      });
+
+      setErroSincronizacao('');
+    } catch (erro) {
+      console.log('Erro ao carregar histórico remoto:', erro.message);
+      setErroSincronizacao(
+        'Não foi possível atualizar o histórico do MongoDB.'
+      );
+    }
+  }
 
   function novaPartida() {
     setDados((anterior) => estadoInicial(anterior.partidas));
@@ -324,7 +476,6 @@ export default function App() {
     setDados((anterior) => {
       const novoPlacar = [...anterior.placar];
 
-      // Permite diminuir, mas nunca ficar abaixo de zero ou acima de 12.
       novoPlacar[equipe] = Math.max(
         0,
         Math.min(
@@ -450,7 +601,12 @@ export default function App() {
             options={{ title: 'Histórico de partidas' }}
           >
             {(props) => (
-              <HistoricoScreen {...props} partidas={dados.partidas} />
+              <HistoricoScreen
+                {...props}
+                partidas={dados.partidas}
+                carregarHistoricoRemoto={carregarHistoricoRemoto}
+                erroSincronizacao={erroSincronizacao}
+              />
             )}
           </Stack.Screen>
         </Stack.Navigator>
@@ -767,11 +923,64 @@ function PartidaScreen({
   );
 }
 
-function HistoricoScreen({ partidas }) {
+function HistoricoScreen({
+  navigation,
+  partidas,
+  carregarHistoricoRemoto,
+  erroSincronizacao,
+}) {
+  const [atualizando, setAtualizando] = useState(false);
+
+  useEffect(() => {
+    const removerListener = navigation.addListener('focus', async () => {
+      setAtualizando(true);
+
+      try {
+        await carregarHistoricoRemoto();
+      } finally {
+        setAtualizando(false);
+      }
+    });
+
+    return removerListener;
+  }, [navigation, carregarHistoricoRemoto]);
+
   return (
     <SafeAreaView style={styles.tela}>
       <ScrollView contentContainerStyle={styles.conteudoHistorico}>
         <Text style={styles.tituloHistorico}>Partidas anteriores</Text>
+
+        <TouchableOpacity
+          style={styles.botaoAtualizar}
+          onPress={async () => {
+            setAtualizando(true);
+
+            try {
+              await carregarHistoricoRemoto();
+            } finally {
+              setAtualizando(false);
+            }
+          }}
+          disabled={atualizando}
+        >
+          <Text style={styles.textoAtualizar}>
+            {atualizando ? 'Atualizando...' : 'Atualizar histórico'}
+          </Text>
+        </TouchableOpacity>
+
+        {erroSincronizacao ? (
+          <Text style={styles.avisoSincronizacao}>
+            {erroSincronizacao}
+          </Text>
+        ) : null}
+
+        {atualizando && (
+          <ActivityIndicator
+            size="small"
+            color="#15803D"
+            style={{ marginTop: 12 }}
+          />
+        )}
 
         {partidas.length === 0 ? (
           <View style={styles.cartao}>
@@ -783,11 +992,15 @@ function HistoricoScreen({ partidas }) {
             </Text>
           </View>
         ) : (
-          partidas.map((partida) => (
+          partidas.map((partida, indice) => (
             <View
               key={String(partida.partidaId)}
               style={styles.cartaoHistorico}
             >
+              <Text style={styles.numeroHistorico}>
+                Partida {indice + 1}
+              </Text>
+
               <Text style={styles.vencedorHistorico}>
                 Vencedor: {partida.vencedor}
               </Text>
@@ -797,7 +1010,22 @@ function HistoricoScreen({ partidas }) {
                 {partida.nomeEles}
               </Text>
 
-              <Text style={styles.dataHistorico}>{partida.data}</Text>
+              <Text style={styles.dataHistorico}>
+                {partida.data || 'Data não disponível'}
+              </Text>
+
+              <Text
+                style={[
+                  styles.statusSincronizacao,
+                  partida.sincronizada
+                    ? styles.statusSincronizado
+                    : styles.statusPendente,
+                ]}
+              >
+                {partida.sincronizada
+                  ? 'Salva no MongoDB'
+                  : 'Aguardando sincronização'}
+              </Text>
             </View>
           ))
         )}
@@ -1118,6 +1346,12 @@ const styles = StyleSheet.create({
     borderLeftColor: '#15803D',
     elevation: 1,
   },
+  numeroHistorico: {
+    color: '#6B7280',
+    fontSize: 12,
+    fontWeight: 'bold',
+    marginBottom: 6,
+  },
   vencedorHistorico: {
     color: '#15803D',
     fontSize: 17,
@@ -1133,6 +1367,36 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     fontSize: 12,
     marginTop: 8,
+  },
+  botaoAtualizar: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  textoAtualizar: {
+    color: '#15803D',
+    fontWeight: 'bold',
+  },
+  avisoSincronizacao: {
+    color: '#B45309',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 12,
+  },
+  statusSincronizacao: {
+    fontSize: 12,
+    marginTop: 8,
+    fontWeight: '600',
+  },
+  statusSincronizado: {
+    color: '#15803D',
+  },
+  statusPendente: {
+    color: '#B45309',
   },
   textoVazio: {
     color: '#111827',
