@@ -1,4 +1,6 @@
-
 node_modules/
-.env
 .expo/
+.env
+dist/
+erro-android.txt
+erro-expo.txt
